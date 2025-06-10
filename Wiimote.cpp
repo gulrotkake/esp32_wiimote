@@ -481,6 +481,32 @@ static void _l2cap_configure(uint16_t connection_handle, uint16_t local_cid, uin
     log_d("queued acl_l2cap_single_packet(l2cap configure)");
 }
 
+static void _l2cap_close(uint16_t connection_handle, uint16_t psm){
+  int idx = l2cap_connection_find_by_psm(connection_handle, psm);
+  if (idx < 0) {
+    log_e("Failed to find connection for handle %02X, and psm %02X", connection_handle, psm);
+    return;
+  }
+
+  struct l2cap_connection_t *l2cap_connection = &l2cap_connection_list[idx];
+
+  uint8_t packet_boundary_flag = 0b10; // Packet_Boundary_Flag
+  uint8_t broadcast_flag = 0b00;       // Broadcast_Flag
+  uint16_t channel_id = 0x0001;
+  uint8_t data[] = {
+      0x06,                                         // CLOSE REQUEST
+      _g_identifier++,                              // Identifier
+      0x04, 0x00,                                   // Length: 0x0004
+      (uint8_t)(l2cap_connection->remote_cid & 0xFF), (uint8_t)(l2cap_connection->remote_cid >> 8), // Destination CID
+      (uint8_t)(l2cap_connection->local_cid & 0xFF), (uint8_t)(l2cap_connection->local_cid >> 8), // Source CID
+    };
+
+    uint16_t data_len = 8;
+    uint16_t len = make_acl_l2cap_single_packet(tmp_data, connection_handle, packet_boundary_flag, broadcast_flag, channel_id, data, data_len);
+    _queue_data(_tx_queue, tmp_data, len); // TODO: check return
+    log_d("queued acl_l2cap_single_packet(l2cap close)");
+}
+
 static void _set_rumble(uint16_t connection_handle, bool rumble){
   int idx = l2cap_connection_find_by_psm(connection_handle, PSM_HID_Interrupt_13);
   struct l2cap_connection_t l2cap_connection = l2cap_connection_list[idx];
@@ -857,6 +883,25 @@ static void process_l2cap_connection_close(uint16_t connection_handle, uint8_t* 
     log_d(" l2cap_connection_remove success, l2cap_connection_size = %d.", rel);
 }
 
+static void process_l2cap_connection_close_response(uint16_t connection_handle, uint8_t* data){
+  uint16_t destination_cid = (data[ 5] << 8) | data[ 4];
+  uint16_t source_cid = (data[ 7] << 8) | data[ 6];
+  log_d("L2CAP CONNECTION CLOSE RESPONSE");
+  log_d("  handle          = %02X", connection_handle);
+  log_d("  destination_cid = %04X", destination_cid);
+  log_d("  souce_cid       = %04X", source_cid);
+
+  int rel = l2cap_connection_remove(connection_handle, source_cid, destination_cid);
+  if(rel==-1)
+    log_d(" l2cap_connection_remove failed.");
+  else
+    log_d(" l2cap_connection_remove success, l2cap_connection_size = %d.", rel);
+
+  // Disconnect HCI
+  uint16_t len = make_cmd_disconnect(tmp_data, connection_handle);
+  _queue_data(_tx_queue, tmp_data, len); // TODO: check return
+}
+
 static void process_report(uint16_t connection_handle, uint8_t* data, uint16_t len){
   log_d("REPORT len=%d data=%s", len, formatHex(data, len));
   _singleton->_callback(WIIMOTE_EVENT_DATA, connection_handle, data, len);
@@ -975,6 +1020,9 @@ static void process_l2cap_data(uint16_t connection_handle, uint16_t channel_id, 
   }else
   if(data[0]==0x06){ // CONNECTION CLOSING ? (Aqee)
     process_l2cap_connection_close(connection_handle, data);
+  }else
+  if(data[0]==0x07){ // CONNECTION CLOSED
+    process_l2cap_connection_close_response(connection_handle, data);
   }else{
     log_d("  ### process_l2cap_data no impl ###");
     log_d("  L2CAP len=%d data=%s", len, formatHex(data, len));
@@ -1150,6 +1198,11 @@ void Wiimote::set_led(uint16_t handle, uint8_t leds){
 
 void Wiimote::set_rumble(uint16_t handle, bool rumble){
   _set_rumble(handle, rumble);
+}
+
+void Wiimote::disconnect(uint16_t handle){
+  _l2cap_close(handle, PSM_HID_Control_11);
+  _l2cap_close(handle, PSM_HID_Interrupt_13);
 }
 
 void Wiimote::get_balance_weight(uint8_t *data, float *weight) {
